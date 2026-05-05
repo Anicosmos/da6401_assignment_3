@@ -53,8 +53,14 @@ def scaled_dot_product_attention(
         output : Attended output,   shape (..., seq_q, d_v)
         attn_w : Attention weights, shape (..., seq_q, seq_k)
     """
-    raise NotImplementedError
-
+    # raise NotImplementedError
+    d_k = Q.size(-1)  # Get the dimensionality of the keys
+    attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)  # Compute scaled dot product
+    if mask is not None:
+        attn_scores = attn_scores.masked_fill(mask, float('-inf'))  # Apply mask
+    attn_weights = F.softmax(attn_scores, dim=-1)  # Compute attention weights
+    output = torch.matmul(attn_weights, V)  # Compute the attended output
+    return output, attn_weights
 
 # ══════════════════════════════════════════════════════════════════════
 # ❷  MASK HELPERS 
@@ -78,7 +84,8 @@ def make_src_mask(
         True  → position is a PAD token (will be masked out)
         False → real token
     """
-    raise NotImplementedError
+    # raise NotImplementedError
+    return src.unsqueeze(1).unsqueeze(2) == pad_idx
 
 
 def make_tgt_mask(
