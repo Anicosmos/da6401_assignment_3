@@ -17,10 +17,59 @@ AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from typing import Optional
 
 from model import Transformer, make_src_mask, make_tgt_mask
+
+try:
+    from evaluate import load as load_metric
+except ImportError:
+    load_metric = None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   PYTORCH DATASET WRAPPER  
+# ══════════════════════════════════════════════════════════════════════
+
+class TranslationDataset(Dataset):
+    """Wraps the processed data for use with PyTorch DataLoader."""
+    
+    def __init__(self, data_list):
+        """
+        Args:
+            data_list : List of (src_indices, tgt_indices) tuples
+        """
+        self.data = data_list
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        src_indices, tgt_indices = self.data[idx]
+        return torch.LongTensor(src_indices), torch.LongTensor(tgt_indices)
+
+
+def collate_batch(batch):
+    """Pad sequences to same length in batch."""
+    srcs, tgts = zip(*batch)
+    
+    # Pad source sequences
+    src_lens = [len(s) for s in srcs]
+    max_src_len = max(src_lens)
+    src_padded = torch.zeros(len(batch), max_src_len, dtype=torch.long)
+    for i, src in enumerate(srcs):
+        src_padded[i, :len(src)] = src
+    
+    # Pad target sequences
+    tgt_lens = [len(t) for t in tgts]
+    max_tgt_len = max(tgt_lens)
+    tgt_padded = torch.zeros(len(batch), max_tgt_len, dtype=torch.long)
+    for i, tgt in enumerate(tgts):
+        tgt_padded[i, :len(tgt)] = tgt
+    
+    return src_padded, tgt_padded
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -42,7 +91,11 @@ class LabelSmoothingLoss(nn.Module):
 
     def __init__(self, vocab_size: int, pad_idx: int, smoothing: float = 0.1) -> None:
         super().__init__()
-        raise NotImplementedError
+        self.vocab_size = vocab_size
+        self.pad_idx = pad_idx
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+        self.smooth_value = smoothing / (vocab_size - 2)  # -2 because we exclude pad and one correct class
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -53,8 +106,67 @@ class LabelSmoothingLoss(nn.Module):
         Returns:
             Scalar loss value.
         """
-        # TODO: Task 3.1
-        raise NotImplementedError
+        # Get log probabilities
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Create smoothed target distribution
+        with torch.no_grad():
+            # Start with smooth distribution everywhere
+            smooth_targets = torch.full_like(log_probs, self.smooth_value)
+            # Set correct class to high confidence
+            smooth_targets.scatter_(1, target.unsqueeze(1), self.confidence)
+            # Set pad indices to 0 probability
+            smooth_targets[:, self.pad_idx] = 0.0
+        
+        # KL-divergence between predicted and smoothed target distributions
+        loss = -torch.sum(smooth_targets * log_probs, dim=-1)
+        
+        # Ignore loss for padding tokens
+        mask = (target != self.pad_idx).float()
+        loss = (loss * mask).sum() / mask.sum()
+        
+        return loss
+
+
+# ══════════════════════════════════════════════════════════════════════
+#   NOAM SCHEDULER  
+# ══════════════════════════════════════════════════════════════════════
+
+class NoamScheduler:
+    """
+    Learning rate scheduler with warmup from "Attention Is All You Need".
+    
+    lrate = d_model^(-0.5) * min(step_num^(-0.5), step_num * warmup_steps^(-1.5))
+    
+    Args:
+        optimizer     : Optimizer to adjust
+        d_model       : Model dimensionality
+        warmup_steps  : Number of warmup steps (default 4000)
+    """
+    
+    def __init__(self, optimizer: torch.optim.Optimizer, d_model: int, warmup_steps: int = 4000):
+        self.optimizer = optimizer
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.step_num = 0
+    
+    def step(self):
+        """Update learning rate and increment step counter."""
+        self.step_num += 1
+        lr = self.d_model ** (-0.5) * min(
+            self.step_num ** (-0.5),
+            self.step_num * self.warmup_steps ** (-1.5)
+        )
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+    
+    def get_last_lr(self):
+        """Get current learning rate."""
+        lr = self.d_model ** (-0.5) * min(
+            self.step_num ** (-0.5),
+            self.step_num * self.warmup_steps ** (-1.5)
+        )
+        return [lr]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -88,7 +200,48 @@ def run_epoch(
         avg_loss : Average loss over the epoch (float).
 
     """
-    raise NotImplementedError
+    total_loss = 0.0
+    total_tokens = 0
+    
+    model.train() if is_train else model.eval()
+    
+    with torch.set_grad_enabled(is_train):
+        for batch_idx, (src, tgt) in enumerate(data_iter):
+            src = src.to(device)
+            tgt = tgt.to(device)
+            
+            # Create masks
+            src_mask = make_src_mask(src).to(device)
+            tgt_mask = make_tgt_mask(tgt).to(device)
+            
+            # Forward pass (decoder input is tgt[:-1], target is tgt[1:])
+            logits = model(src, tgt[:, :-1], src_mask, tgt_mask[:, :, :-1, :-1])
+            
+            # Reshape for loss computation
+            logits_reshaped = logits.reshape(-1, logits.size(-1))
+            tgt_reshaped = tgt[:, 1:].reshape(-1)
+            
+            # Compute loss
+            loss = loss_fn(logits_reshaped, tgt_reshaped)
+            
+            if is_train:
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                
+                if scheduler is not None:
+                    scheduler.step()
+            
+            # Track loss
+            batch_size = src.size(0)
+            tgt_len = (tgt[:, 1:] != 0).sum().item()  # count non-pad tokens
+            total_loss += loss.item() * tgt_len
+            total_tokens += tgt_len
+    
+    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+    return avg_loss
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -122,8 +275,36 @@ def greedy_decode(
              or when max_len is reached.
 
     """
-    # TODO: Task 3.3 — implement token-by-token greedy decoding
-    raise NotImplementedError
+    model.eval()
+    
+    # Start with <sos>
+    ys = torch.ones(1, 1, dtype=torch.long).fill_(start_symbol).to(device)
+    
+    with torch.no_grad():
+        for _ in range(max_len - 1):
+            # Prepare target mask for current sequence length
+            tgt_mask = make_tgt_mask(ys).to(device)
+            
+            # Decode
+            logits = model.decode(
+                model.encode(src, src_mask),
+                src_mask,
+                ys,
+                tgt_mask
+            )
+            
+            # Get prediction for next token (greedy: argmax)
+            next_token_logits = logits[:, -1, :]  # [1, vocab_size]
+            next_token = next_token_logits.argmax(dim=-1).unsqueeze(1)  # [1, 1]
+            
+            # Append next token
+            ys = torch.cat([ys, next_token], dim=1)
+            
+            # Stop if we generate <eos>
+            if next_token.item() == end_symbol:
+                break
+    
+    return ys
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -154,8 +335,128 @@ def evaluate_bleu(
         bleu_score : Corpus-level BLEU (float, range 0–100).
 
     """
-    # TODO: Task 3 — loop test set, decode, compute and return BLEU
-    raise NotImplementedError
+    model.eval()
+    
+    # Get special token indices
+    sos_idx = tgt_vocab['<sos>']
+    eos_idx = tgt_vocab['<eos>']
+    
+    # Map vocab indices to tokens
+    def indices_to_tokens(indices, vocab):
+        """Convert indices to tokens using vocab."""
+        tokens = []
+        # Create reverse vocab
+        idx_to_token = {v: k for k, v in vocab.items()}
+        for idx in indices:
+            if idx in idx_to_token:
+                tokens.append(idx_to_token[idx])
+        return tokens
+    
+    predictions = []
+    references = []
+    
+    with torch.no_grad():
+        for src, tgt in test_dataloader:
+            src = src.to(device)
+            tgt = tgt.to(device)
+            
+            # Create source mask
+            src_mask = make_src_mask(src).to(device)
+            
+            # Generate predictions
+            for i in range(src.size(0)):
+                src_i = src[i:i+1]
+                src_mask_i = src_mask[i:i+1]
+                
+                # Greedy decode
+                pred_indices = greedy_decode(
+                    model, src_i, src_mask_i, max_len,
+                    sos_idx, eos_idx, device
+                ).squeeze(0).cpu().tolist()
+                
+                # Convert indices to tokens
+                pred_tokens = indices_to_tokens(pred_indices[1:], tgt_vocab)  # Skip <sos>
+                # Remove <eos> if present
+                if '<eos>' in pred_tokens:
+                    pred_tokens = pred_tokens[:pred_tokens.index('<eos>')]
+                
+                # Reference
+                ref_indices = tgt[i, 1:].cpu().tolist()  # Skip <sos>
+                # Find <eos> if present
+                if eos_idx in ref_indices:
+                    ref_indices = ref_indices[:ref_indices.index(eos_idx)]
+                ref_tokens = indices_to_tokens(ref_indices, tgt_vocab)
+                
+                predictions.append(' '.join(pred_tokens))
+                references.append([' '.join(ref_tokens)])
+    
+    # Compute BLEU using evaluate library
+    if load_metric is not None:
+        bleu = load_metric("bleu")
+        results = bleu.compute(predictions=predictions, references=references)
+        return results["bleu"] * 100  # Scale to 0-100
+    else:
+        # Fallback: use basic BLEU calculation
+        from collections import Counter
+        import math
+        
+        def simple_bleu(reference_corpus, translation_corpus, max_order=4):
+            """Simple BLEU score calculation."""
+            matches_by_order = [0] * max_order
+            possible_matches_by_order = [0] * max_order
+            reference_length = 0
+            translation_length = 0
+            
+            for (references, translation) in zip(reference_corpus, translation_corpus):
+                reference_length += min(len(r.split()) for r in references)
+                translation_length += len(translation.split())
+                
+                translated_ngrams = Counter()
+                for ngram_size in range(1, max_order + 1):
+                    for i in range(len(translation.split()) - ngram_size + 1):
+                        ngram = ' '.join(translation.split()[i:i + ngram_size])
+                        translated_ngrams[ngram_size - 1] += 1
+                
+                for ngram_order in range(1, max_order + 1):
+                    matches = 0
+                    possible_matches = len(translation.split()) - ngram_order + 1
+                    if possible_matches < 0:
+                        possible_matches = 0
+                    
+                    max_ref_count = 0
+                    for reference in references:
+                        reference_ngrams = Counter()
+                        for i in range(len(reference.split()) - ngram_order + 1):
+                            ngram = ' '.join(reference.split()[i:i + ngram_order])
+                            reference_ngrams[ngram] += 1
+                        max_ref_count = max(max_ref_count, reference_ngrams.get(' '.join(translation.split()[max(0, len(translation.split()) - ngram_order)
+                                                                                            if len(translation.split()) >= ngram_order else 0:]), 0))
+                    
+                    matches_by_order[ngram_order - 1] += min(translated_ngrams[ngram_order - 1], max_ref_count)
+                    possible_matches_by_order[ngram_order - 1] += possible_matches
+            
+            precisions = [0] * max_order
+            for i in range(0, max_order):
+                if possible_matches_by_order[i] > 0:
+                    precisions[i] = float(matches_by_order[i]) / possible_matches_by_order[i]
+                else:
+                    precisions[i] = 0.0
+            
+            if min(precisions) > 0:
+                p_log_sum = sum((1.0 / max_order) * math.log(p) for p in precisions)
+                geo_mean = math.exp(p_log_sum)
+            else:
+                geo_mean = 0
+            
+            if translation_length < reference_length:
+                brevity_penalty = math.exp(1 - float(reference_length) / translation_length)
+            else:
+                brevity_penalty = 1.0
+            
+            bleu = geo_mean * brevity_penalty
+            return bleu * 100
+        
+        return simple_bleu(references, predictions)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -192,8 +493,16 @@ def save_checkpoint(
          'd_model': ..., 'N': ..., 'num_heads': ...,
          'd_ff': ..., 'dropout': ...}
     """
-    # TODO: implement using torch.save({...}, path)
-    raise NotImplementedError
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': {
+            'step_num': scheduler.step_num,
+        },
+        'model_config': model.config,
+    }
+    torch.save(checkpoint, path)
 
 
 def load_checkpoint(
@@ -215,8 +524,17 @@ def load_checkpoint(
         epoch : The epoch at which the checkpoint was saved (int).
 
     """
-    # TODO: implement restore logic
-    raise NotImplementedError
+    checkpoint = torch.load(path, map_location='cpu')
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler is not None:
+        scheduler.step_num = checkpoint['scheduler_state_dict']['step_num']
+    
+    return checkpoint['epoch']
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -246,8 +564,135 @@ def run_training_experiment() -> None:
                bleu = evaluate_bleu(model, test_loader, tgt_vocab)
                wandb.log({'test_bleu': bleu})
     """
-    # TODO: implement full experiment
-    raise NotImplementedError
+    import wandb
+    from dataset import Multi30kDataset
+    
+    # Hyperparameters
+    d_model = 512
+    num_heads = 8
+    d_ff = 2048
+    N = 6
+    num_epochs = 15
+    batch_size = 32
+    dropout = 0.1
+    warmup_steps = 4000
+    lr_smoothing = 0.1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Initialize W&B
+    wandb.init(
+        project="da6401-a3",
+        config={
+            'd_model': d_model,
+            'num_heads': num_heads,
+            'd_ff': d_ff,
+            'N': N,
+            'num_epochs': num_epochs,
+            'batch_size': batch_size,
+            'dropout': dropout,
+            'warmup_steps': warmup_steps,
+            'label_smoothing': lr_smoothing,
+        }
+    )
+    
+    print("Loading dataset...")
+    # Load and process dataset
+    dataset = Multi30kDataset()
+    dataset.build_vocab()
+    train_data, val_data, test_data = dataset.process_data()
+    
+    src_vocab_size = len(dataset.de_vocab)
+    tgt_vocab_size = len(dataset.en_vocab)
+    pad_idx = dataset.en_vocab['<pad>']
+    
+    print(f"Source vocab size: {src_vocab_size}")
+    print(f"Target vocab size: {tgt_vocab_size}")
+    
+    # Create DataLoaders
+    train_dataset = TranslationDataset(train_data)
+    val_dataset = TranslationDataset(val_data)
+    test_dataset = TranslationDataset(test_data)
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_batch
+    )
+    
+    print("Creating model...")
+    # Create model
+    model = Transformer(
+        src_vocab_size=src_vocab_size,
+        tgt_vocab_size=tgt_vocab_size,
+        d_model=d_model,
+        N=N,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        dropout=dropout,
+    )
+    model = model.to(device)
+    
+    # Create optimizer
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        betas=(0.9, 0.98),
+        eps=1e-9,
+    )
+    
+    # Create scheduler
+    scheduler = NoamScheduler(optimizer, d_model, warmup_steps)
+    
+    # Create loss function
+    loss_fn = LabelSmoothingLoss(tgt_vocab_size, pad_idx, lr_smoothing)
+    
+    print("Starting training...")
+    best_val_loss = float('inf')
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        
+        # Training
+        train_loss = run_epoch(
+            train_loader, model, loss_fn, optimizer, scheduler,
+            epoch, is_train=True, device=device
+        )
+        print(f"Train Loss: {train_loss:.4f}")
+        
+        # Validation
+        val_loss = run_epoch(
+            val_loader, model, loss_fn, None, None,
+            epoch, is_train=False, device=device
+        )
+        print(f"Val Loss: {val_loss:.4f}")
+        
+        # Log to W&B
+        wandb.log({
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'learning_rate': scheduler.get_last_lr()[0],
+        })
+        
+        # Save checkpoint if validation loss improves
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(model, optimizer, scheduler, epoch, "best_checkpoint.pt")
+            print("Saved best checkpoint")
+    
+    # Load best model and evaluate on test set
+    print("\nLoading best model and evaluating on test set...")
+    load_checkpoint("best_checkpoint.pt", model, optimizer, scheduler)
+    
+    test_bleu = evaluate_bleu(model, test_loader, dataset.en_vocab, device, max_len=100)
+    print(f"Test BLEU: {test_bleu:.2f}")
+    
+    wandb.log({'test_bleu': test_bleu})
+    wandb.finish()
 
 
 if __name__ == "__main__":
