@@ -16,6 +16,8 @@ AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
 
 import math
 import copy
+import os
+import gdown
 from typing import Optional, Tuple
 
 import torch
@@ -466,6 +468,7 @@ class Transformer(nn.Module):
         num_heads: int   = 8,
         d_ff:      int   = 2048,
         dropout:   float = 0.1,
+        checkpoint_path: str = None,
     ) -> None:
         super().__init__()
         
@@ -497,10 +500,21 @@ class Transformer(nn.Module):
         # Output projection to vocabulary
         self.generator = nn.Linear(d_model, tgt_vocab_size)
         
-        # Initialize weights
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        # Initialize or instantiate weights
+        
+        # TODO: Instantiate 
+        # init should also load the model weights if checkpoint path provided, download the .pth file like this
+        if checkpoint_path is not None:
+            downloaded = gdown.download(id="<.pth drive id>", output=checkpoint_path, quiet=False)
+            if downloaded is None:
+                raise RuntimeError(f"Failed to download checkpoint from Google Drive. Please check the ID and your internet connection.")
+            self.load_state_dict(torch.load(checkpoint_path,map_location=torch.device('cpu')))
+
+        else :
+            for p in self.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+        # raise NotImplementedError
 
     # ── AUTOGRADER HOOKS ── keep these signatures exactly ─────────────
 
@@ -570,3 +584,18 @@ class Transformer(nn.Module):
         """
         memory = self.encode(src, src_mask)
         return self.decode(memory, src_mask, tgt, tgt_mask)
+        # raise NotImplementedError
+
+
+    def infer(self, src_sentence: str) -> str:
+        """
+        Translates a German sentence to English using greedy autoregressive decoding.
+        
+        Args:
+            src_sentence: The raw German text.
+            
+            
+        Returns:
+            The fully translated English string, detokenized and clean.
+        """
+        raise NotImplementedError
