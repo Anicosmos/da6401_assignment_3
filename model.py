@@ -72,14 +72,14 @@ def scaled_dot_product_attention(
 
 def make_src_mask(
     src: torch.Tensor,
-    pad_idx: int = 1,
+    pad_idx: int = 0,
 ) -> torch.Tensor:
     """
     Build a padding mask for the encoder (source sequence).
 
     Args:
         src     : Source token-index tensor, shape [batch, src_len]
-        pad_idx : Vocabulary index of the <pad> token (default 1)
+        pad_idx : Vocabulary index of the <pad> token (default 0)
 
     Returns:
         Boolean mask, shape [batch, 1, 1, src_len]
@@ -92,22 +92,21 @@ def make_src_mask(
 
 def make_tgt_mask(
     tgt: torch.Tensor,
-    pad_idx: int = 1,
+    pad_idx: int = 0,
 ) -> torch.Tensor:
     """
     Build a combined padding + causal (look-ahead) mask for the decoder.
 
     Args:
         tgt     : Target token-index tensor, shape [batch, tgt_len]
-        pad_idx : Vocabulary index of the <pad> token (default 1)
+        pad_idx : Vocabulary index of the <pad> token (default 0)
 
     Returns:
         Boolean mask, shape [batch, 1, tgt_len, tgt_len]
         True → position is masked out (PAD or future token)
     """
     # Padding mask
-    pad_mask = tgt.unsqueeze(1).unsqueeze(2) == pad_idx
-    pad_mask = pad_mask.unsqueeze(1)  # [batch, 1, 1, tgt_len]
+    pad_mask = tgt.unsqueeze(1).unsqueeze(2) == pad_idx  # [batch, 1, 1, tgt_len]
     
     # Causal mask (look-ahead mask)
     tgt_len = tgt.size(1)
@@ -200,18 +199,35 @@ class MultiHeadAttention(nn.Module):
 
 class PositionalEncoding(nn.Module):
     """
-    Sinusoidal Positional Encoding as in "Attention Is All You Need", §3.5.
+    Positional Encoding as in "Attention Is All You Need", §3.5.
+    
+    Supports two modes:
+    - 'sinusoidal' (default): Fixed sinusoidal encoding (non-trainable)
+    - 'learned': Learned positional embeddings (trainable)
 
     Args:
         d_model  (int)  : Embedding dimensionality.
         dropout  (float): Dropout applied after adding encodings.
         max_len  (int)  : Maximum sequence length to pre-compute (default 5000).
+        mode     (str)  : 'sinusoidal' or 'learned' (default: 'sinusoidal').
     """
 
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000, mode: str = 'sinusoidal') -> None:
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
+        self.mode = mode
+        self.d_model = d_model
+        self.max_len = max_len
         
+        if mode == 'sinusoidal':
+            self._init_sinusoidal(max_len, d_model)
+        elif mode == 'learned':
+            self._init_learned(max_len, d_model)
+        else:
+            raise ValueError(f"Unknown positional encoding mode: {mode}")
+    
+    def _init_sinusoidal(self, max_len: int, d_model: int) -> None:
+        """Initialize sinusoidal positional encoding (non-trainable)."""
         # Create PE matrix: [max_len, d_model]
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [max_len, 1]
@@ -224,6 +240,11 @@ class PositionalEncoding(nn.Module):
         # Register as buffer (not trainable parameter)
         pe = pe.unsqueeze(0)  # [1, max_len, d_model]
         self.register_buffer('pe', pe)
+    
+    def _init_learned(self, max_len: int, d_model: int) -> None:
+        """Initialize learned positional embeddings (trainable)."""
+        # Learnable embedding for positions
+        self.pos_embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -232,11 +253,19 @@ class PositionalEncoding(nn.Module):
 
         Returns:
             Tensor of same shape [batch, seq_len, d_model]
-            = x  +  PE[:, :seq_len, :]  
+            = x  +  positional_encoding[:, :seq_len, :]  
 
         """
         seq_len = x.size(1)
-        x = x + self.pe[:, :seq_len, :]
+        
+        if self.mode == 'sinusoidal':
+            x = x + self.pe[:, :seq_len, :]
+        elif self.mode == 'learned':
+            # Get position indices [0, 1, 2, ..., seq_len-1]
+            positions = torch.arange(0, seq_len, dtype=torch.long, device=x.device).unsqueeze(0)  # [1, seq_len]
+            pos_embed = self.pos_embedding(positions)  # [1, seq_len, d_model]
+            x = x + pos_embed
+        
         return self.dropout(x)
 
 
@@ -461,16 +490,37 @@ class Transformer(nn.Module):
 
     def __init__(
         self,
-        src_vocab_size: int,
-        tgt_vocab_size: int,
+        src_vocab_size: Optional[int] = None,
+        tgt_vocab_size: Optional[int] = None,
         d_model:   int   = 512,
         N:         int   = 6,
         num_heads: int   = 8,
         d_ff:      int   = 2048,
         dropout:   float = 0.1,
-        checkpoint_path: str = None,
+        checkpoint_path: Optional[str] = None,
+        checkpoint_drive_id: Optional[str] = None,
+        pos_encoding_mode: str = 'sinusoidal',
     ) -> None:
         super().__init__()
+
+        self.pad_idx = 0
+        self.sos_idx = 1
+        self.eos_idx = 2
+        self.unk_idx = 3
+
+        self.src_tokenizer = None
+        self.tgt_tokenizer = None
+        self.src_vocab = None
+        self.tgt_vocab = None
+        self.src_inv_vocab = None
+        self.tgt_inv_vocab = None
+
+        self._load_inference_assets()
+
+        if src_vocab_size is None:
+            src_vocab_size = len(self.src_vocab)
+        if tgt_vocab_size is None:
+            tgt_vocab_size = len(self.tgt_vocab)
         
         # Store config for checkpointing
         self.config = {
@@ -481,6 +531,7 @@ class Transformer(nn.Module):
             'num_heads': num_heads,
             'd_ff': d_ff,
             'dropout': dropout,
+            'pos_encoding_mode': pos_encoding_mode,
         }
         
         # Embeddings
@@ -488,7 +539,7 @@ class Transformer(nn.Module):
         self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model)
         
         # Positional encoding
-        self.pos_encoding = PositionalEncoding(d_model, dropout)
+        self.pos_encoding = PositionalEncoding(d_model, dropout, mode=pos_encoding_mode)
         
         # Encoder and Decoder
         encoder_layer = EncoderLayer(d_model, num_heads, d_ff, dropout)
@@ -500,21 +551,47 @@ class Transformer(nn.Module):
         # Output projection to vocabulary
         self.generator = nn.Linear(d_model, tgt_vocab_size)
         
-        # Initialize or instantiate weights
-        
-        # TODO: Instantiate 
-        # init should also load the model weights if checkpoint path provided, download the .pth file like this
-        if checkpoint_path is not None:
-            downloaded = gdown.download(id="<.pth drive id>", output=checkpoint_path, quiet=False)
-            if downloaded is None:
-                raise RuntimeError(f"Failed to download checkpoint from Google Drive. Please check the ID and your internet connection.")
-            self.load_state_dict(torch.load(checkpoint_path,map_location=torch.device('cpu')))
+        self._load_or_initialize_weights(checkpoint_path, checkpoint_drive_id)
 
-        else :
-            for p in self.parameters():
-                if p.dim() > 1:
-                    nn.init.xavier_uniform_(p)
-        # raise NotImplementedError
+    def _load_inference_assets(self) -> None:
+        """Load tokenizers and vocabularies required by infer() inside __init__."""
+        from dataset import Multi30kDataset
+
+        data = Multi30kDataset()
+        data.build_vocab()
+
+        self.src_tokenizer = data.tokenize_de
+        self.tgt_tokenizer = data.tokenize_en
+        self.src_vocab = data.de_vocab
+        self.tgt_vocab = data.en_vocab
+        self.src_inv_vocab = {i: t for t, i in data.de_vocab.items()}
+        self.tgt_inv_vocab = {i: t for t, i in data.en_vocab.items()}
+
+    def _load_or_initialize_weights(
+        self,
+        checkpoint_path: Optional[str],
+        checkpoint_drive_id: Optional[str],
+    ) -> None:
+        """Load weights from local path or Google Drive; otherwise Xavier-init."""
+        if checkpoint_path is None:
+            checkpoint_path = os.getenv("A3_CHECKPOINT_PATH", "transformer_weights.pt")
+
+        if checkpoint_drive_id is None:
+            checkpoint_drive_id = os.getenv("A3_CHECKPOINT_DRIVE_ID")
+
+        if (not os.path.exists(checkpoint_path)) and checkpoint_drive_id:
+            gdown.download(id=checkpoint_drive_id, output=checkpoint_path, quiet=False)
+
+        if os.path.exists(checkpoint_path):
+            state = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+            if isinstance(state, dict) and "model_state_dict" in state:
+                state = state["model_state_dict"]
+            self.load_state_dict(state)
+            return
+
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
     # ── AUTOGRADER HOOKS ── keep these signatures exactly ─────────────
 
@@ -584,8 +661,6 @@ class Transformer(nn.Module):
         """
         memory = self.encode(src, src_mask)
         return self.decode(memory, src_mask, tgt, tgt_mask)
-        # raise NotImplementedError
-
 
     def infer(self, src_sentence: str) -> str:
         """
@@ -594,8 +669,69 @@ class Transformer(nn.Module):
         Args:
             src_sentence: The raw German text.
             
-            
         Returns:
             The fully translated English string, detokenized and clean.
         """
-        raise NotImplementedError
+        if self.src_tokenizer is None or self.src_vocab is None:
+            raise RuntimeError("Inference assets are not available.")
+        
+        device = next(self.parameters()).device
+        
+        # Tokenize source
+        src_tokens = self.src_tokenizer(src_sentence)
+        
+        # Convert to indices
+        unk_idx = self.src_vocab.get('<unk>', self.unk_idx)
+        sos_idx = self.src_vocab.get('<sos>', self.sos_idx)
+        eos_idx = self.tgt_vocab.get('<eos>', self.eos_idx)
+        pad_idx = self.src_vocab.get('<pad>', self.pad_idx)
+        
+        src_eos_idx = self.src_vocab.get('<eos>', self.eos_idx)
+        src_indices = [sos_idx] + [self.src_vocab.get(token, unk_idx) for token in src_tokens] + [src_eos_idx]
+        src_tensor = torch.LongTensor(src_indices).unsqueeze(0).to(device)  # [1, src_len]
+        
+        # Create mask
+        src_mask = make_src_mask(src_tensor, pad_idx).to(device)
+        
+        # Encode
+        with torch.no_grad():
+            memory = self.encode(src_tensor, src_mask)
+            
+            # Decode greedily
+            ys = torch.ones(1, 1, dtype=torch.long).fill_(sos_idx).to(device)
+            max_len = 100
+            
+            for _ in range(max_len - 1):
+                tgt_mask = make_tgt_mask(ys, pad_idx).to(device)
+                logits = self.decode(memory, src_mask, ys, tgt_mask)
+                
+                # Get next token (greedy)
+                next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                ys = torch.cat([ys, next_token], dim=1)
+                
+                # Stop if we generate <eos>
+                if next_token.item() == eos_idx:
+                    break
+        
+        # Convert indices to tokens
+        pred_indices = ys.squeeze(0).cpu().tolist()
+        pred_tokens = [
+            self.tgt_inv_vocab.get(idx, '<unk>')
+            for idx in pred_indices[1:]  # Skip <sos>
+        ]
+        
+        # Remove <eos> and <pad> tokens
+        if '<eos>' in pred_tokens:
+            pred_tokens = pred_tokens[:pred_tokens.index('<eos>')]
+        pred_tokens = [t for t in pred_tokens if t != '<pad>']
+        
+        # Detokenize and return
+        return ' '.join(pred_tokens)
+
+
+def test_infer(german_sentence: str = "ein kleines kind spielt im park") -> str:
+    """Simple local smoke test for autograder-style single-sentence inference."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Transformer().to(device)
+    model.eval()
+    return model.infer(german_sentence)

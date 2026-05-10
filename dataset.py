@@ -110,12 +110,11 @@ class Multi30kDataset:
         # raise NotImplementedError
 
 
-## Test the dataset class and tokenization
-# Create an instance of the dataset
+if __name__ == '__main__':
+    # Quick sanity test for local development.
+    ds = Multi30kDataset(split='train')
+    ds.build_vocab()
+    train_p, val_p, test_p = ds.process_data()
 
-ds = Multi30kDataset(split='train')
-ds.build_vocab()
-train_p, val_p, test_p = ds.process_data()
-
-print(len(train_p), len(val_p), len(test_p))
-print(train_p[0][0][:10], train_p[0][1][:10]) 
+    print(len(train_p), len(val_p), len(test_p))
+    print(train_p[0][0][:10], train_p[0][1][:10])

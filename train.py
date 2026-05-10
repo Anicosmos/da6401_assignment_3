@@ -17,15 +17,18 @@ AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from typing import Optional
 
 from model import Transformer, make_src_mask, make_tgt_mask
+from lr_scheduler import NoamScheduler
+from dataset import Multi30kDataset
 
 try:
-    from evaluate import load as load_metric
+    from bleu import list_bleu
 except ImportError:
-    load_metric = None
+    list_bleu = None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -128,45 +131,7 @@ class LabelSmoothingLoss(nn.Module):
         return loss
 
 
-# ══════════════════════════════════════════════════════════════════════
-#   NOAM SCHEDULER  
-# ══════════════════════════════════════════════════════════════════════
 
-class NoamScheduler:
-    """
-    Learning rate scheduler with warmup from "Attention Is All You Need".
-    
-    lrate = d_model^(-0.5) * min(step_num^(-0.5), step_num * warmup_steps^(-1.5))
-    
-    Args:
-        optimizer     : Optimizer to adjust
-        d_model       : Model dimensionality
-        warmup_steps  : Number of warmup steps (default 4000)
-    """
-    
-    def __init__(self, optimizer: torch.optim.Optimizer, d_model: int, warmup_steps: int = 4000):
-        self.optimizer = optimizer
-        self.d_model = d_model
-        self.warmup_steps = warmup_steps
-        self.step_num = 0
-    
-    def step(self):
-        """Update learning rate and increment step counter."""
-        self.step_num += 1
-        lr = self.d_model ** (-0.5) * min(
-            self.step_num ** (-0.5),
-            self.step_num * self.warmup_steps ** (-1.5)
-        )
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-    
-    def get_last_lr(self):
-        """Get current learning rate."""
-        lr = self.d_model ** (-0.5) * min(
-            self.step_num ** (-0.5),
-            self.step_num * self.warmup_steps ** (-1.5)
-        )
-        return [lr]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -182,7 +147,7 @@ def run_epoch(
     epoch_num: int = 0,
     is_train: bool = True,
     device: str = "cpu",
-) -> float:
+) -> tuple:
     """
     Run one epoch of training or evaluation.
 
@@ -197,11 +162,13 @@ def run_epoch(
         device     : 'cpu' or 'cuda'.
 
     Returns:
-        avg_loss : Average loss over the epoch (float).
+        Tuple[float, float]: (avg_loss, accuracy) where accuracy is token-level accuracy on validation.
+                             During training, accuracy is 0.0 (not computed for efficiency).
 
     """
     total_loss = 0.0
     total_tokens = 0
+    correct_tokens = 0  # Track correct predictions for accuracy
     
     model.train() if is_train else model.eval()
     
@@ -224,6 +191,14 @@ def run_epoch(
             # Compute loss
             loss = loss_fn(logits_reshaped, tgt_reshaped)
             
+            # Compute token-level accuracy (non-pad tokens only)
+            if not is_train:
+                predictions = logits_reshaped.argmax(dim=-1)
+                # Only count non-pad tokens
+                non_pad_mask = (tgt_reshaped != 0)
+                if non_pad_mask.sum() > 0:
+                    correct_tokens += (predictions[non_pad_mask] == tgt_reshaped[non_pad_mask]).sum().item()
+            
             if is_train:
                 # Backward pass
                 optimizer.zero_grad()
@@ -241,7 +216,8 @@ def run_epoch(
             total_tokens += tgt_len
     
     avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-    return avg_loss
+    accuracy = correct_tokens / total_tokens if total_tokens > 0 else 0.0
+    return avg_loss, accuracy
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -332,7 +308,7 @@ def evaluate_bleu(
         max_len         : Max decode length per sentence.
 
     Returns:
-        bleu_score : Corpus-level BLEU (float, range 0–100).
+        bleu_score : Corpus-level BLEU (float, range 0-100).
 
     """
     model.eval()
@@ -340,17 +316,11 @@ def evaluate_bleu(
     # Get special token indices
     sos_idx = tgt_vocab['<sos>']
     eos_idx = tgt_vocab['<eos>']
-    
-    # Map vocab indices to tokens
-    def indices_to_tokens(indices, vocab):
-        """Convert indices to tokens using vocab."""
-        tokens = []
-        # Create reverse vocab
-        idx_to_token = {v: k for k, v in vocab.items()}
-        for idx in indices:
-            if idx in idx_to_token:
-                tokens.append(idx_to_token[idx])
-        return tokens
+    pad_idx = tgt_vocab['<pad>']
+    idx_to_token = {v: k for k, v in tgt_vocab.items()}
+
+    def indices_to_tokens(indices):
+        return [idx_to_token[idx] for idx in indices if idx in idx_to_token]
     
     predictions = []
     references = []
@@ -375,88 +345,41 @@ def evaluate_bleu(
                 ).squeeze(0).cpu().tolist()
                 
                 # Convert indices to tokens
-                pred_tokens = indices_to_tokens(pred_indices[1:], tgt_vocab)  # Skip <sos>
-                # Remove <eos> if present
+                pred_tokens = indices_to_tokens(pred_indices[1:])  # Skip <sos>
                 if '<eos>' in pred_tokens:
                     pred_tokens = pred_tokens[:pred_tokens.index('<eos>')]
                 
                 # Reference
                 ref_indices = tgt[i, 1:].cpu().tolist()  # Skip <sos>
-                # Find <eos> if present
                 if eos_idx in ref_indices:
                     ref_indices = ref_indices[:ref_indices.index(eos_idx)]
-                ref_tokens = indices_to_tokens(ref_indices, tgt_vocab)
+                ref_tokens = indices_to_tokens(ref_indices)
+                ref_tokens = [tok for tok in ref_tokens if tok != '<pad>']
                 
-                predictions.append(' '.join(pred_tokens))
-                references.append([' '.join(ref_tokens)])
+                # Only add non-empty predictions and references
+                pred_sent = ' '.join(pred_tokens)
+                ref_sent = ' '.join(ref_tokens)
+                
+                # Skip if both are empty
+                if pred_sent.strip() or ref_sent.strip():
+                    predictions.append(pred_sent)
+                    references.append([ref_sent])
+
+    # Verify lengths match
+    if len(predictions) != len(references):
+        print(f"Warning: Predictions ({len(predictions)}) and references ({len(references)}) have different lengths!")
+        # Trim to match lengths
+        min_len = min(len(predictions), len(references))
+        predictions = predictions[:min_len]
+        references = references[:min_len]
     
-    # Compute BLEU using evaluate library
-    if load_metric is not None:
-        bleu = load_metric("bleu")
-        results = bleu.compute(predictions=predictions, references=references)
-        return results["bleu"] * 100  # Scale to 0-100
-    else:
-        # Fallback: use basic BLEU calculation
-        from collections import Counter
-        import math
-        
-        def simple_bleu(reference_corpus, translation_corpus, max_order=4):
-            """Simple BLEU score calculation."""
-            matches_by_order = [0] * max_order
-            possible_matches_by_order = [0] * max_order
-            reference_length = 0
-            translation_length = 0
-            
-            for (references, translation) in zip(reference_corpus, translation_corpus):
-                reference_length += min(len(r.split()) for r in references)
-                translation_length += len(translation.split())
-                
-                translated_ngrams = Counter()
-                for ngram_size in range(1, max_order + 1):
-                    for i in range(len(translation.split()) - ngram_size + 1):
-                        ngram = ' '.join(translation.split()[i:i + ngram_size])
-                        translated_ngrams[ngram_size - 1] += 1
-                
-                for ngram_order in range(1, max_order + 1):
-                    matches = 0
-                    possible_matches = len(translation.split()) - ngram_order + 1
-                    if possible_matches < 0:
-                        possible_matches = 0
-                    
-                    max_ref_count = 0
-                    for reference in references:
-                        reference_ngrams = Counter()
-                        for i in range(len(reference.split()) - ngram_order + 1):
-                            ngram = ' '.join(reference.split()[i:i + ngram_order])
-                            reference_ngrams[ngram] += 1
-                        max_ref_count = max(max_ref_count, reference_ngrams.get(' '.join(translation.split()[max(0, len(translation.split()) - ngram_order)
-                                                                                            if len(translation.split()) >= ngram_order else 0:]), 0))
-                    
-                    matches_by_order[ngram_order - 1] += min(translated_ngrams[ngram_order - 1], max_ref_count)
-                    possible_matches_by_order[ngram_order - 1] += possible_matches
-            
-            precisions = [0] * max_order
-            for i in range(0, max_order):
-                if possible_matches_by_order[i] > 0:
-                    precisions[i] = float(matches_by_order[i]) / possible_matches_by_order[i]
-                else:
-                    precisions[i] = 0.0
-            
-            if min(precisions) > 0:
-                p_log_sum = sum((1.0 / max_order) * math.log(p) for p in precisions)
-                geo_mean = math.exp(p_log_sum)
-            else:
-                geo_mean = 0
-            
-            if translation_length < reference_length:
-                brevity_penalty = math.exp(1 - float(reference_length) / translation_length)
-            else:
-                brevity_penalty = 1.0
-            
-            bleu = geo_mean * brevity_penalty
-            return bleu * 100
-        
-        return simple_bleu(references, predictions)
+    # Use bleu library to compute BLEU score
+    if len(predictions) == 0:
+        print("Warning: No valid predictions generated!")
+        return 0.0
+    
+    bleu_score = list_bleu(references, predictions)
+    return float(bleu_score)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -498,7 +421,7 @@ def save_checkpoint(
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': {
-            'step_num': scheduler.step_num,
+            'last_epoch': scheduler.last_epoch,
         },
         'model_config': model.config,
     }
@@ -532,7 +455,7 @@ def load_checkpoint(
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
     if scheduler is not None:
-        scheduler.step_num = checkpoint['scheduler_state_dict']['step_num']
+        scheduler.last_epoch = checkpoint['scheduler_state_dict']['last_epoch']
     
     return checkpoint['epoch']
 
@@ -565,7 +488,6 @@ def run_training_experiment() -> None:
                wandb.log({'test_bleu': bleu})
     """
     import wandb
-    from dataset import Multi30kDataset
     
     # Hyperparameters
     d_model = 512
@@ -657,24 +579,26 @@ def run_training_experiment() -> None:
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
         # Training
-        train_loss = run_epoch(
+        train_loss, _ = run_epoch(
             train_loader, model, loss_fn, optimizer, scheduler,
             epoch, is_train=True, device=device
         )
         print(f"Train Loss: {train_loss:.4f}")
         
         # Validation
-        val_loss = run_epoch(
+        val_loss, val_accuracy = run_epoch(
             val_loader, model, loss_fn, None, None,
             epoch, is_train=False, device=device
         )
         print(f"Val Loss: {val_loss:.4f}")
+        print(f"Val Accuracy: {val_accuracy:.4f}")
         
         # Log to W&B
         wandb.log({
             'epoch': epoch,
             'train_loss': train_loss,
             'val_loss': val_loss,
+            'val_accuracy': val_accuracy,
             'learning_rate': scheduler.get_last_lr()[0],
         })
         
