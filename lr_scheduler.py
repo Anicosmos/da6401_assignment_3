@@ -58,8 +58,7 @@ class NoamScheduler(LRScheduler):
         if step <= 0:
             step = 1
 
-        return self.d_model ** (-0.5) * min(
-            step ** (-0.5),
+        return self.d_model ** (-0.5) * min( step ** (-0.5),
             step * self.warmup_steps ** (-1.5),
         )
 

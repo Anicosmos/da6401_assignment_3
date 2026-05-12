@@ -31,9 +31,7 @@ except ImportError:
     list_bleu = None
 
 
-# ══════════════════════════════════════════════════════════════════════
 #   PYTORCH DATASET WRAPPER  
-# ══════════════════════════════════════════════════════════════════════
 
 class TranslationDataset(Dataset):
     """Wraps the processed data for use with PyTorch DataLoader."""

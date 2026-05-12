@@ -56,12 +56,14 @@ def scaled_dot_product_attention(
         attn_w : Attention weights, shape (..., seq_q, seq_k)
     """
     # raise NotImplementedError
-    d_k = Q.size(-1)  # Get the dimensionality of the keys
-    attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)  # Compute scaled dot product
+    d_k = Q.size(-1)  # THis Gets the dimensionality of the keys
+    K_transposed = K.transpose(-2, -1)  # flip last 2 dims so Q can match K^T
+    scale = math.sqrt(d_k) ## Which is used to scale the dot product to prevent it from growing too large
+    attn_scores = torch.matmul(Q, K_transposed) / scale  # Compute scaled dot product
     if mask is not None:
         attn_scores = attn_scores.masked_fill(mask, float('-inf'))  # Apply mask
     attn_weights = F.softmax(attn_scores, dim=-1)  # Compute attention weights
-    output = torch.matmul(attn_weights, V)  # Compute the attended output
+    output = torch.matmul(attn_weights, V)  # The Final Compute the attended output
     return output, attn_weights
 
 # ══════════════════════════════════════════════════════════════════════
@@ -87,6 +89,7 @@ def make_src_mask(
         False → real token
     """
     # raise NotImplementedError
+    ## unsqueeze to add dimensions for broadcasting: [batch, 1, 1, src_len]
     return src.unsqueeze(1).unsqueeze(2) == pad_idx
 
 
@@ -320,9 +323,11 @@ class EncoderLayer(nn.Module):
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        ## Sub Layer 1: Self-Attention
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout) 
+        # Sub Layer 2: Position-wise Feed-Forward Network
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        
+        # 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(p=dropout)
@@ -337,14 +342,14 @@ class EncoderLayer(nn.Module):
             shape [batch, src_len, d_model]
 
         """
-        # Post-LayerNorm: x → attention → add & norm
-        attn_output = self.self_attn(x, x, x, src_mask)
-        x = x + self.dropout(attn_output)
+        # Post-LayerNorm: x -> attention  -> add & norm
+        attn_output = self.self_attn.forward(x, x, x, src_mask)
+        x = x + self.dropout(attn_output) # Redidual connection + dropout
         x = self.norm1(x)
         
-        # Post-LayerNorm: x → ffn → add & norm
-        ffn_output = self.feed_forward(x)
-        x = x + self.dropout(ffn_output)
+        # Post-LayerNorm: x ->  ffn ->  add & norm
+        ffn_output = self.feed_forward.forward(x)
+        x = x + self.dropout.forward(ffn_output)
         x = self.norm2(x)
         
         return x
@@ -370,10 +375,14 @@ class DecoderLayer(nn.Module):
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
+        ## defing the three sublayers of the decoder layer
+        ## Sub Layer 1: Masked Self-Attention
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        ## Sub Layer 2: Cross-Attention with encoder memory 
         self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        ## Sub Layer 3: Position-wise Feed-Forward Network
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        
+
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
@@ -397,18 +406,18 @@ class DecoderLayer(nn.Module):
             shape [batch, tgt_len, d_model]
         """
         # Post-LayerNorm: Masked self-attention
-        self_attn_output = self.self_attn(x, x, x, tgt_mask)
-        x = x + self.dropout(self_attn_output)
+        self_attn_output = self.self_attn.forward(x, x, x, tgt_mask)
+        x = x + self.dropout.forward(self_attn_output)
         x = self.norm1(x)
         
         # Post-LayerNorm: Cross-attention with encoder memory
-        cross_attn_output = self.cross_attn(x, memory, memory, src_mask)
-        x = x + self.dropout(cross_attn_output)
+        cross_attn_output = self.cross_attn.forward(x, memory, memory, src_mask)
+        x = x + self.dropout.forward(cross_attn_output)
         x = self.norm2(x)
         
         # Post-LayerNorm: Feed-forward
-        ffn_output = self.feed_forward(x)
-        x = x + self.dropout(ffn_output)
+        ffn_output = self.feed_forward.forward(x)
+        x = x + self.dropout.forward(ffn_output)
         x = self.norm3(x)
         
         return x
@@ -421,7 +430,7 @@ class DecoderLayer(nn.Module):
 class Encoder(nn.Module):
     """Stack of N identical EncoderLayer modules with final LayerNorm."""
 
-    def __init__(self, layer: EncoderLayer, N: int) -> None:
+    def __init__(self, layer: EncoderLayer, N: int=6) -> None:
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])
         self.norm = nn.LayerNorm(layer.self_attn.d_model)
@@ -443,7 +452,7 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     """Stack of N identical DecoderLayer modules with final LayerNorm."""
 
-    def __init__(self, layer: DecoderLayer, N: int) -> None:
+    def __init__(self, layer: DecoderLayer, N: int=6) -> None:
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])
         self.norm = nn.LayerNorm(layer.self_attn.d_model)
@@ -492,8 +501,8 @@ class Transformer(nn.Module):
         self,
         src_vocab_size: Optional[int] = None,
         tgt_vocab_size: Optional[int] = None,
-        d_model:   int   = 512,
-        N:         int   = 6,
+        d_model:   int   = 512, # Given 
+        N:         int   = 6, # Mentioned in the paper , each sublayer encoder (2) and decoder (3) is repeated N=6 times
         num_heads: int   = 8,
         d_ff:      int   = 2048,
         dropout:   float = 0.1,

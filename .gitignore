@@ -4,3 +4,5 @@ __pycache__/lr_scheduler.cpython-310.pyc
 __pycache__/model.cpython-310.pyc
 __pycache__/train.cpython-310.pyc
 *.pt
+__pycache__/dataset.cpython-313.pyc
+__pycache__/*
